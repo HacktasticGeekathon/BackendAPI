@@ -3,8 +3,6 @@ import yt_dlp as youtube_dl
 import boto3
 import time
 import os
-import aiohttp
-import asyncio
 
 app = FastAPI()
 
