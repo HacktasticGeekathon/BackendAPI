@@ -14,6 +14,12 @@ from app.clients.fallacy_detector import FallacyDetectionClient, Mode
 
 app = FastAPI()
 
+
+@app.get("/health")
+def health():
+    return {"healthy": True}
+
+
 bucket_name = 'videos-20241122232253111200000001'
 bucket_url = 'https://d2yom3r6s9mhn3.cloudfront.net/'
 
