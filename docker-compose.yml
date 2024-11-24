@@ -1,9 +1,9 @@
 services:
   backend-api:
-    image: backend_api
+    image: jcoelho584/backend-api
     build:
       context: .
     ports:
-      - 8001:8001
+      - 8000:8000
     env_file:
       - .env
