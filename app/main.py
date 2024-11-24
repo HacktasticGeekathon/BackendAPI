@@ -1,94 +1,152 @@
-from fastapi import FastAPI, HTTPException
-import yt_dlp as youtube_dl
-import boto3
-import time
 import os
+import re
+import boto3
+import requests
+import uuid
+import asyncio
+import logging
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from yt_dlp import YoutubeDL
+
+from app.classes.fallacy import Fallacy
+from app.classes.transcript import TranscriptResponse
+from app.clients.fallacy_detector import FallacyDetectionClient, Mode
 
 app = FastAPI()
 
 bucket_name = 'videos-20241122232253111200000001'
+bucket_url = 'https://d2yom3r6s9mhn3.cloudfront.net/'
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('app.test')
+
+transcribe_client = boto3.client('transcribe')
+s3_client = boto3.client('s3')
+fallacy_detection_client = FallacyDetectionClient()
+
+YT_VIDEO_ID_PATTERN = re.compile(
+    r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
 
 
-def download_youtube_video(youtube_url, download_path):
-    ydl_opts = {
-        'format': 'best[ext=mp4]',
-        'outtmpl': f'{download_path}/%(title)s.%(ext)s',
-        'noplaylist': True,
-    }
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/process")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    logger.info("WebSocket client connected")
+
     try:
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.download([youtube_url])
-            if result != 0:
-                raise HTTPException(status_code=500, detail="Download failed")
-        # Return the path to the downloaded video
-        return next(f for f in os.listdir(download_path) if f.endswith('.mp4'))
-    except youtube_dl.utils.DownloadError as e:
-        print(f"Download error: {str(e)}")
-        raise HTTPException(status_code=500, detail="An error occurred with yt-dlp")
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        while True:
+            youtube_url = await websocket.receive_text()
+            youtube_thumbnail = get_youtube_thumbnail(youtube_url)
+            filename = await download_video(youtube_url)
+            s3 = await upload_to_s3(filename)
+            await manager.broadcast({"video": bucket_url + s3.get("key"), "thumbnail": youtube_thumbnail})
+
+            transcription = await transcribe_audio(s3.get("url"))
+            #fallacies = await process_fallacies(transcription)
+            await update_status("Fetching facts analysis...")
+            #facts_checked = fallacy_detection_client.analyze(transcripts_list, Mode.FACT_CHECKING)
+            #await manager.broadcast({"fallacies": fallacies, "facts": facts_checked})
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+        manager.disconnect(websocket)
+
+async def process_fallacies(transcription):
+    await update_status("Processing fallacies...")
+
+    transcript_response = TranscriptResponse.from_transcription_data(transcription)
+    transcripts_list = transcript_response.transcripts_only()
+    timestamps_list = [(seg.start_time, seg.end_time) for seg in transcript_response.audio_segments]
+
+    fallacy_detection_response = fallacy_detection_client.analyze(transcripts_list, Mode.FALLACY_DETECTION)
+
+    return Fallacy.from_json(fallacy_detection_response, timestamps_list)
 
 
-def upload_to_s3(file_path, s3_key):
-    s3_client = boto3.client('s3')
-    s3_client.upload_file(file_path, bucket_name, s3_key)
-    return f"s3://{bucket_name}/{s3_key}"
+async def download_video(youtube_url: str):
+    await update_status("Downloading video...")
+
+    ydl_opts = {
+        "format": "best",
+        "outtmpl": "%(title)s.%(ext)s"
+    }
+
+    logger.info(f"Starting to download video from {youtube_url}")
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(youtube_url, download=True)
+        filename = ydl.prepare_filename(info)
+        return filename
 
 
-def start_transcription_job(job_name, media_uri):
-    transcribe_client = boto3.client('transcribe')
+async def upload_to_s3(filename):
+    await update_status("Uploading video...")
+    s3_key = f"{uuid.uuid4()}.mp4"
+    s3_client.upload_file(filename, bucket_name, s3_key)
+    s3_url = f"https://{bucket_name}.s3.amazonaws.com/{s3_key}"
+    os.remove(filename)
+    return {'url': s3_url, 'key': s3_key}
+
+
+async def transcribe_audio(s3_url):
+    await update_status("Transcribing audio...")
+
+    job_name = f"transcribe-job-{uuid.uuid4()}"
+    media_format = "mp4"
+
     transcribe_client.start_transcription_job(
         TranscriptionJobName=job_name,
-        Media={'MediaFileUri': media_uri},
-        MediaFormat='mp4',
-        IdentifyLanguage=True,
-        OutputBucketName=bucket_name
+        Media={"MediaFileUri": s3_url},
+        MediaFormat=media_format,
+        IdentifyLanguage=True
     )
 
-
-def get_transcription_result(job_name):
-    transcribe_client = boto3.client('transcribe')
-
     while True:
-        result = transcribe_client.get_transcription_job(TranscriptionJobName=job_name)
-        status = result['TranscriptionJob']['TranscriptionJobStatus']
-
-        if status == 'COMPLETED':
+        status = transcribe_client.get_transcription_job(TranscriptionJobName=job_name)
+        job_status = status["TranscriptionJob"]["TranscriptionJobStatus"]
+        if job_status in ["COMPLETED", "FAILED"]:
             break
-        elif status == 'FAILED':
-            raise HTTPException(status_code=500, detail="Transcription job failed")
+        await asyncio.sleep(1)
 
-@app.post("/transcribe/")
-async def transcribe_youtube_video(youtube_url: str):
-    try:
-        job_name = f"transcription-{int(time.time())}"
+    if job_status == "COMPLETED":
+        transcript_url = status["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
+        response = requests.get(transcript_url)
+        response.raise_for_status()
 
-        # Download YouTube video
-        download_path = 'tmp'
-        video_file = download_youtube_video(youtube_url, download_path)
-        video_path = os.path.join(download_path, video_file)
+        transcription_data = response.json()["results"]
 
-        # Upload video to S3
-        s3_key = f"uploaded_videos/{os.path.basename(video_path)}"
-        media_uri = upload_to_s3(video_path, s3_key)
+        return transcription_data
+    else:
+        return None
 
-        # Start transcription job
-        start_transcription_job(job_name, media_uri,)
+async def update_status(status):
+        await manager.broadcast({"status": status})
 
-        # Get transcription result
-        get_transcription_result(job_name)
+def get_youtube_id(url):
+    match = YT_VIDEO_ID_PATTERN.match(url)
+    return match.group(6) if match else None
 
-        # Clean up downloaded video
-        os.remove(video_path)
+def get_youtube_thumbnail(youtube_url):
+    video_id = get_youtube_id(youtube_url)
+    if not video_id:
+        return None
 
-        return "success motherfoka"
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"

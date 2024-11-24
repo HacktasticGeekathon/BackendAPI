@@ -1,0 +1,9 @@
+services:
+  backend-api:
+    image: backend_api
+    build:
+      context: .
+    ports:
+      - 8001:8001
+    env_file:
+      - .env
