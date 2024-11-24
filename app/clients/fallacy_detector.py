@@ -1,6 +1,6 @@
 import requests
 from enum import Enum
-
+import json
 
 class Mode(Enum):
     FALLACY_DETECTION = "logical-reasoning"
@@ -9,9 +9,9 @@ class Mode(Enum):
 
 class FallacyDetectionClient:
     def __init__(self):
-        self.base_url = "http://localhost:8080"
+        self.base_url = "http://127.0.0.1:8080"
         self.analyze_endpoint = "/analyze"
-        self.model_id = "meta.llama3-1-8b-instruct-v1:0"
+        self.model_id = "meta.llama3-1-70b-instruct-v1:0"
         self.headers = {
             "Content-Type": "application/json"
         }
@@ -23,7 +23,9 @@ class FallacyDetectionClient:
             "model_id": self.model_id,
             "mode": mode.value
         }
+        fallacies = requests.post(url, json=payload, headers=self.headers)
+        fallacies.raise_for_status()
+        payload["mode"] = Mode.FACT_CHECKING.value
+        facts = requests.post(url, json=payload, headers=self.headers)
 
-        response = requests.post(url, json=payload, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+        return {"fallacies": fallacies.json(), "facts": facts.json(),}
