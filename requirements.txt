@@ -3,3 +3,4 @@ yt-dlp~=2024.11.18
 boto3~=1.35.68
 uvicorn~=0.32.1
 requests~=2.32.3
+websockets~=14.1

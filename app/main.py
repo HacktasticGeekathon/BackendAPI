@@ -8,17 +8,12 @@ import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from yt_dlp import YoutubeDL
 
+from app.classes.fact_check import FactCheck
 from app.classes.fallacy import Fallacy
 from app.classes.transcript import TranscriptResponse
 from app.clients.fallacy_detector import FallacyDetectionClient, Mode
 
 app = FastAPI()
-
-
-@app.get("/health")
-def health():
-    return {"healthy": True}
-
 
 bucket_name = 'videos-20241122232253111200000001'
 bucket_url = 'https://d2yom3r6s9mhn3.cloudfront.net/'
@@ -53,7 +48,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-@app.websocket("/process")
+@app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     logger.info("WebSocket client connected")
@@ -67,25 +62,37 @@ async def websocket_endpoint(websocket: WebSocket):
             await manager.broadcast({"video": bucket_url + s3.get("key"), "thumbnail": youtube_thumbnail})
 
             transcription = await transcribe_audio(s3.get("url"))
-            #fallacies = await process_fallacies(transcription)
-            await update_status("Fetching facts analysis...")
-            #facts_checked = fallacy_detection_client.analyze(transcripts_list, Mode.FACT_CHECKING)
-            #await manager.broadcast({"fallacies": fallacies, "facts": facts_checked})
+            transcript_response = TranscriptResponse.from_transcription_data(transcription)
+            transcripts_list = transcript_response.transcripts_only()
+            timestamps_list = [(seg.start_time, seg.end_time) for seg in transcript_response.audio_segments]
+
+            await process_fallacies_and_facts(transcripts_list, timestamps_list)
+            # facts = await process_facts(transcripts_list, timestamps_list)
+            # await manager.broadcast({"fallacies": fallacies, "facts": facts})
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
         manager.disconnect(websocket)
 
-async def process_fallacies(transcription):
-    await update_status("Processing fallacies...")
-
-    transcript_response = TranscriptResponse.from_transcription_data(transcription)
-    transcripts_list = transcript_response.transcripts_only()
-    timestamps_list = [(seg.start_time, seg.end_time) for seg in transcript_response.audio_segments]
+async def process_fallacies_and_facts(transcripts_list, timestamps_list):
+    await update_status("Processing fallacies and fact checking...")
 
     fallacy_detection_response = fallacy_detection_client.analyze(transcripts_list, Mode.FALLACY_DETECTION)
+    fallacies_list = Fallacy.from_json(fallacy_detection_response.get("fallacies"), timestamps_list)
+    facts_list = FactCheck.from_json(fallacy_detection_response.get("facts"), timestamps_list)
 
-    return Fallacy.from_json(fallacy_detection_response, timestamps_list)
+    fallacies_dict = [fallacy.to_dict() for fallacy in fallacies_list]
+    facts_dict = [fact.to_dict() for fact in facts_list]
+
+    await manager.broadcast({"fallacies": fallacies_dict, "facts": facts_dict})
+
+async def process_facts(transcripts_list, timestamps_list):
+    await update_status("Processing fallacies...")
+
+    facts_response = fallacy_detection_client.analyze(transcripts_list, Mode.FACT_CHECKING)
+    fallacies_list = FactCheck.from_json(facts_response, timestamps_list)
+
+    return [fact.to_dict() for fact in fallacies_list]
 
 
 async def download_video(youtube_url: str):
@@ -156,3 +163,7 @@ def get_youtube_thumbnail(youtube_url):
         return None
 
     return f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+
+@app.get("/health")
+def read_health():
+    return {"status": "healthy"}

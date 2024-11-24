@@ -1,3 +1,5 @@
+import os
+
 import requests
 from enum import Enum
 import json
@@ -9,7 +11,8 @@ class Mode(Enum):
 
 class FallacyDetectionClient:
     def __init__(self):
-        self.base_url = "http://127.0.0.1:8080"
+
+        self.base_url = os.getenv("FALLACY_API_URL","http://127.0.0.1:8000")
         self.analyze_endpoint = "/analyze"
         self.model_id = "meta.llama3-1-70b-instruct-v1:0"
         self.headers = {
